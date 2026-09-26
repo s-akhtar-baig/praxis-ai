@@ -715,6 +715,7 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
     """
 
     captured_bodies: ClassVar[list[dict]] = []
+    stream_deltas: ClassVar[list[dict]] = []
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -724,6 +725,21 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
                 type(self).captured_bodies.append(json.loads(body))
             except json.JSONDecodeError:
                 pass
+        if body and json.loads(body).get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for delta in type(self).stream_deltas:
+                chunk = {
+                    "id": "chatcmpl_reasoning_capture", "object": "chat.completion.chunk",
+                    "model": VLLM_MODEL, "choices": [{"index": 0, "delta": delta}],
+                }
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                self.wfile.flush()
+            self.wfile.write(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+            self.wfile.flush()
+            return
         payload = json.dumps(
             {
                 "id": "chatcmpl_reasoning_capture",
@@ -1572,6 +1588,7 @@ def _reasoning_capture_session(tmp_path_factory, request):
     model output: the test checks the assistant reasoning field forwarded upstream.
     """
     ChatCaptureHandler.captured_bodies = []
+    ChatCaptureHandler.stream_deltas = [{"reasoning": "I picked "}, {"reasoning_content": "42."}]
     captured = ChatCaptureHandler.captured_bodies
     backend_port = _free_port()
     server = HTTPServer(("127.0.0.1", backend_port), ChatCaptureHandler)
@@ -2771,13 +2788,77 @@ class TestOpenAIResponsesVLLM:
 class TestResponsesReasoningVLLM:
     """Reasoning-dialect translation exercised through the OpenAI SDK."""
 
-    def test_reasoning_summary_request_is_rejected(self, reasoning_client):
+    def test_streaming_reasoning_sdk_events_and_stored_continuation(self, reasoning_capture_client):
+        """The SDK consumes raw reasoning events and persisted reasoning-only output."""
+        client, forwarded = reasoning_capture_client
+        with client.responses.stream(model=VLLM_MODEL, input="Pick a number.", store=True) as stream:
+            events = list(stream)
+            final = stream.get_final_response()
+        deltas = [event for event in events if event.type == "response.reasoning_text.delta"]
+        assert "".join(event.delta for event in deltas) == "I picked 42."
+        assert all(event.content_index == 0 and event.output_index == 0 for event in deltas)
+        assert final.status == "completed"
+        assert len(final.output) == 1
+        item = final.output[0]
+        assert item.type == "reasoning" and item.summary == []
+        assert item.content[0].type == "reasoning_text"
+        assert item.content[0].text == "I picked 42."
+        assert all(event.item_id == item.id for event in deltas)
+        done = next(event for event in events if event.type == "response.reasoning_text.done")
+        assert done.text == item.content[0].text
+        stored = client.responses.retrieve(final.id)
+        assert stored.output[0].model_dump() == item.model_dump()
+        client.responses.create(model=VLLM_MODEL, previous_response_id=final.id, input="Which number?", store=False)
+        assert forwarded[-1]["messages"][1] == {
+            "role": "assistant", "content": None, "reasoning": "I picked 42.",
+        }
+
+    @pytest.mark.parametrize("bad_delta", [
+        {"reasoning": {"invalid": "provider-private-data"}},
+        {"reasoning": "x" * 65536},
+    ], ids=["malformed", "over-budget"])
+    def test_streaming_reasoning_failure_has_no_completed_items(self, reasoning_capture_client, bad_delta):
+        client, _ = reasoning_capture_client
+        ChatCaptureHandler.stream_deltas = [{"reasoning": "valid prefix"}, bad_delta]
+        events = list(client.responses.create(
+            model=VLLM_MODEL, input="Think.", stream=True, store=False,
+        ))
+        assert events[-1].type == "response.failed"
+        assert events[-1].response.output == []
+        assert not any(event.type == "response.output_item.done" for event in events)
+        assert not any(event.type == "response.reasoning_text.done" for event in events)
+        assert "provider-private-data" not in events[-1].model_dump_json()
+        deltas = [event.delta for event in events if event.type == "response.reasoning_text.delta"]
+        assert deltas == ["valid prefix"]
+
+    @requires_real_inference
+    def test_live_streaming_reasoning_translation(self, reasoning_client):
+        """Exercise the dialect against the configured live vLLM endpoint."""
+        with reasoning_client.responses.stream(
+            model=VLLM_MODEL, input="What is 17 times 23? Think before answering.",
+            max_output_tokens=1024, store=True,
+        ) as stream:
+            events = list(stream)
+            final = stream.get_final_response()
+        assert final.status in {"completed", "incomplete"}
+        deltas = [event for event in events if event.type == "response.reasoning_text.delta"]
+        assert deltas, "the configured reasoning model must emit raw reasoning"
+        item = next(item for item in final.output if item.type == "reasoning")
+        assert item.summary == []
+        assert item.content[0].text == "".join(event.delta for event in deltas)
+        assert all(event.item_id == item.id for event in deltas)
+        stored = reasoning_client.responses.retrieve(final.id)
+        assert stored.output[0].model_dump() == final.output[0].model_dump()
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_reasoning_summary_request_is_rejected(self, reasoning_client, streaming):
         """vLLM has no safe-summary contract, so a summary request is a 400."""
         with pytest.raises(BadRequestError) as exc_info:
             reasoning_client.responses.create(
                 model=VLLM_MODEL,
                 input="What is 2+2?",
                 reasoning={"summary": "auto"},
+                stream=streaming,
                 store=False,
                 max_output_tokens=64,
             )

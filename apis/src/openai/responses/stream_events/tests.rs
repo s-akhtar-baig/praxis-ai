@@ -6617,3 +6617,32 @@ async fn poisoned_stream_never_leaks_rolled_back_lowered_name_on_later_done() {
         "the logical stream must terminate with an error event: {eos_out}"
     );
 }
+
+#[test]
+fn logical_stream_preserves_reasoning_wire_discriminators() {
+    for event_type in [
+        "response.reasoning_text.delta",
+        "response.reasoning_text.done",
+        "response.reasoning.delta",
+        "response.reasoning.done",
+    ] {
+        let (filter, mut ctx) = make_armed_context();
+        let mut body = Some(make_sse_chunk(
+            event_type,
+            &json!({
+                "item_id":"rs_test", "output_index":0, "content_index":0,
+                "delta":"thought", "text":"thought", "sequence_number":0,
+            }),
+        ));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        let bytes = body.unwrap();
+        let wire = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            wire.starts_with(&format!("event: {event_type}\n")),
+            "wire alias must survive logical composition: {wire}"
+        );
+        let data = wire.lines().find_map(|line| line.strip_prefix("data: ")).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(payload["type"], event_type);
+    }
+}

@@ -21,11 +21,19 @@ pub(crate) enum ReasoningDialect {
     /// Portable Chat Completions fields only, reasoning.summary unsupported.
     #[default]
     None,
-    /// Supports `message.reasoning` and falls back to the deprecated `message.reasoning_content`.
+    /// Supports `reasoning` on messages and deltas, falling back to the deprecated `reasoning_content`.
     Vllm,
 }
 
 impl ReasoningDialect {
+    /// Raw reasoning fields in preference order, shared by finite and streaming extraction.
+    pub(crate) const fn raw_fields(self) -> &'static [&'static str] {
+        match self {
+            Self::None => &[],
+            Self::Vllm => &["reasoning", "reasoning_content"],
+        }
+    }
+
     /// Whether the dialect exposes safe summaries.
     const fn supports_safe_summary(self) -> bool {
         // Generating a summary through an additional inference call is out of scope.
@@ -44,7 +52,7 @@ impl ReasoningDialect {
 }
 
 /// Resolved backend-specific reasoning configuration.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub(crate) struct ReasoningOptions {
     /// Selected backend reasoning contract.
@@ -282,17 +290,8 @@ fn resolve_raw_reasoning(
     message: &Map<String, Value>,
     dialect: ReasoningDialect,
 ) -> Result<Option<&str>, TranslationError> {
-    match dialect {
-        ReasoningDialect::None => Ok(None),
-        ReasoningDialect::Vllm => resolve_vllm_reasoning(message),
-    }
-}
-
-/// Resolve raw reasoning for vLLM. Prefers the current `reasoning` field
-/// and falls back to the deprecated `reasoning_content` alias.
-fn resolve_vllm_reasoning(message: &Map<String, Value>) -> Result<Option<&str>, TranslationError> {
-    for field in ["reasoning", "reasoning_content"] {
-        match message.get(field) {
+    for field in dialect.raw_fields() {
+        match message.get(*field) {
             // A null, empty, or absent field is not a payload; try the next name.
             None | Some(Value::Null) => {},
             Some(Value::String(text)) if text.is_empty() => {},

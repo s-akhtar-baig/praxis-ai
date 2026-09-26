@@ -133,24 +133,21 @@ fn legacy_max_body_bytes_is_rejected() {
 }
 
 #[test]
-fn streaming_with_reasoning_dialect_is_rejected() {
-    // Streaming reasoning translation is deferred (#36).
+fn streaming_with_reasoning_dialect_is_allowed() {
     let request = json!({"model": "m", "input": "hi", "stream": true});
     let vllm = ReasoningOptions {
         dialect: ReasoningDialect::Vllm,
         ..ReasoningOptions::default()
     };
 
-    let action = reject_incompatible_reasoning(&request, &vllm, true)
-        .expect_err("streaming must be rejected while a reasoning dialect is enabled");
-    assert!(matches!(action, FilterAction::Reject(_)));
+    reject_incompatible_reasoning(&request, &vllm).expect("streaming reasoning translation is supported");
 }
 
 #[test]
 fn streaming_without_reasoning_dialect_is_allowed() {
     let request = json!({"model": "m", "input": "hi", "stream": true});
 
-    reject_incompatible_reasoning(&request, &ReasoningOptions::default(), true)
+    reject_incompatible_reasoning(&request, &ReasoningOptions::default())
         .expect("the default dialect performs no reasoning translation and permits streaming");
 }
 
@@ -162,7 +159,7 @@ fn non_streaming_with_reasoning_dialect_is_allowed() {
         ..ReasoningOptions::default()
     };
 
-    reject_incompatible_reasoning(&request, &vllm, false).expect("non-streaming reasoning translation is supported");
+    reject_incompatible_reasoning(&request, &vllm).expect("non-streaming reasoning translation is supported");
 }
 
 #[test]

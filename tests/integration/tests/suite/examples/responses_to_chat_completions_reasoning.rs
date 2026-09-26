@@ -295,3 +295,74 @@ fn reasoning_summary_request_is_rejected_before_forwarding() {
         "a summary request must not reach a dialect without a safe-summary contract"
     );
 }
+
+#[test]
+fn streamed_reasoning_is_stored_and_replayed_with_the_assistant_answer() {
+    let mut sse = String::new();
+    for delta in [
+        serde_json::json!({"reasoning": "I picked "}),
+        serde_json::json!({"reasoning_content": "42."}),
+        serde_json::json!({"content": "Done."}),
+    ] {
+        sse.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id":"chatcmpl_stream", "object":"chat.completion.chunk", "model":"deepseek-r1",
+                "choices":[{"index":0, "delta":delta}]
+            })
+        ));
+    }
+    sse.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, sse),
+        (
+            200,
+            serde_json::json!({"id":"chatcmpl_followup", "object":"chat.completion", "model":"deepseek-r1",
+            "choices":[{"index":0, "message":{"role":"assistant","content":"42"},"finish_reason":"stop"}]})
+            .to_string(),
+        ),
+    ])
+    .start_with_shutdown();
+    let (config, _db) = load_test_config(
+        "stream_reasoning_replay",
+        free_port(),
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"deepseek-r1","input":"Pick a number.","stream":true,"store":true}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200);
+    let body = parse_body(&raw);
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).expect("translated event should be JSON"))
+        .collect();
+    let terminal = &events.last().expect("stream has a terminal")["response"];
+    assert_eq!(terminal["status"], "completed");
+    assert_eq!(terminal["output"][0]["content"][0]["text"], "I picked 42.");
+    assert_eq!(terminal["output"][0]["summary"], serde_json::json!([]));
+    assert_eq!(terminal["output"][1]["content"][0]["text"], "Done.");
+    let reasoning_deltas: String = events
+        .iter()
+        .filter(|event| event["type"] == "response.reasoning_text.delta")
+        .map(|event| event["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(reasoning_deltas, "I picked 42.");
+    let continuation = serde_json::json!({"model":"deepseek-r1","previous_response_id":terminal["id"],
+        "input":"Which number?","stream":false,"store":false});
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &continuation.to_string()));
+    assert_eq!(parse_status(&raw), 200);
+    let captured = backend.requests();
+    assert_eq!(captured.len(), 2);
+    let forwarded: serde_json::Value = serde_json::from_str(&captured[1].body).unwrap();
+    assert_eq!(
+        forwarded["messages"][1],
+        serde_json::json!({"role":"assistant","content":"Done.","reasoning":"I picked 42."})
+    );
+}
